@@ -158,7 +158,7 @@ dependencies = [
   "uvicorn==0.52.4",
   "wcwidth==0.8.2",
   "websocket-client==1.9.0",
-  "websockets==15.0.1",
+  "websockets==17.3",
   "werkzeug==3.1.9",
   "wheel==0.48.0",
   "wrapt==1.16.0",
