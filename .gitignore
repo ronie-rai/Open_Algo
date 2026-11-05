@@ -48,6 +48,9 @@ log/test/
 # Strategy encryption key
 db/strategy_encryption.key
 
+# Python strategy backtest runs and their data cache (blueprints/python_strategy.py)
+strategies/backtests/
+
 # DB backup files (created by upgrade/rotate_pepper.py and other migrations)
 db/backups/
 

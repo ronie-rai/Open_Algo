@@ -16,6 +16,7 @@ broker/tradesmart/api/data.py::_websocket_cls::TradeSmartWebSocket  # benign: bi
 
 # --- Warn-once and log-once flags ----------------------------------------
 # A race costs at most one repeated log line.
+services/python_backtest/guards.py::_note::_warned  # benign: warn-once set in the backtest runner subprocess, not the gunicorn worker; a race repeats one log line
 services/agent/catalog.py::_litellm::_import_failed  # benign: records a failed optional import; a repeat only repeats the log line
 services/agent/stream.py::_estimate_cost_usd::_cost_lookup_warned  # benign: warn-once flag
 services/agent/tools/base.py::OpenAlgoToolkit._write_audit::_audit_sink_warned  # benign: warn-once flag
@@ -25,6 +26,7 @@ utils/real_threading.py::_wake_hub::_hub_wake_failed_logged  # benign: log-once 
 utils/stream_registry.py::thread_budget::_headroom_warned  # benign: warn-once flag
 
 # --- Objects local to one call --------------------------------------------
+services/python_backtest/runner.py::CappedWriter.write::self.written  # benign: the writer lives in the backtest runner subprocess, which serves no requests and is not the gunicorn worker; it is written to from the strategy's one thread
 broker/groww/api/data.py::BrokerData.fix_timestamps::df.index  # benign: a DataFrame built inside this call, never shared
 broker/groww/api/data.py::BrokerData.get_history::df.index  # benign: a DataFrame built inside this call, never shared
 broker/kotak/api/data.py::BrokerData.__init__::self.base_url  # benign: set once while the object is being constructed

@@ -1,3 +1,4 @@
+import type { BacktestParams, BacktestRun, BacktestRunList } from '@/types/python-backtest'
 import type {
   EnvironmentVariables,
   LogContent,
@@ -215,6 +216,51 @@ export const pythonStrategyApi = {
    */
   getMasterContractStatus: async (): Promise<MasterContractStatus> => {
     const response = await webClient.get<MasterContractStatus>('/python/status')
+    return response.data
+  },
+
+  /**
+   * Start a backtest of a strategy. Returns at once with the run id; the
+   * results page polls getBacktestRun until it finishes.
+   */
+  startBacktest: async (
+    strategyId: string,
+    params: BacktestParams
+  ): Promise<ApiResponse<{ run_id: string }>> => {
+    const response = await webClient.post<ApiResponse<{ run_id: string }>>(
+      `/python/api/backtest/${strategyId}`,
+      params
+    )
+    return response.data
+  },
+
+  /**
+   * Past and current backtests of a strategy, newest first
+   */
+  getBacktestRuns: async (strategyId: string): Promise<BacktestRunList> => {
+    const response = await webClient.get<{ data: BacktestRunList }>(
+      `/python/api/backtest/${strategyId}`
+    )
+    return response.data.data
+  },
+
+  /**
+   * One backtest: progress while it runs, results once it is done
+   */
+  getBacktestRun: async (strategyId: string, runId: string): Promise<BacktestRun> => {
+    const response = await webClient.get<{ data: BacktestRun }>(
+      `/python/api/backtest/${strategyId}/${runId}`
+    )
+    return response.data.data
+  },
+
+  /**
+   * Stop a running backtest; it keeps the results of the time it ran
+   */
+  stopBacktest: async (strategyId: string, runId: string): Promise<ApiResponse<void>> => {
+    const response = await webClient.post<ApiResponse<void>>(
+      `/python/api/backtest/${strategyId}/${runId}/stop`
+    )
     return response.data
   },
 

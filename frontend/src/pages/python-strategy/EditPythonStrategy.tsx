@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Download,
   FileCode,
+  FlaskConical,
   Maximize2,
   Minimize2,
   Play,
@@ -28,6 +29,7 @@ import { PythonEditor } from '@/components/ui/python-editor'
 import { Skeleton } from '@/components/ui/skeleton'
 import type { PythonStrategy, PythonStrategyContent } from '@/types/python-strategy'
 import { showToast } from '@/utils/toast'
+import { BacktestDialog } from './BacktestDialog'
 
 export default function EditPythonStrategy() {
   const { strategyId } = useParams<{ strategyId: string }>()
@@ -40,6 +42,7 @@ export default function EditPythonStrategy() {
   const [saving, setSaving] = useState(false)
   const [actionLoading, setActionLoading] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
+  const [backtestOpen, setBacktestOpen] = useState(false)
 
   const hasChanges = code !== originalCode
   const isRunning = strategy?.status === 'running'
@@ -347,6 +350,20 @@ export default function EditPythonStrategy() {
         <div className="flex gap-2">
           {runControl}
           {logsLink}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setBacktestOpen(true)}
+            disabled={hasChanges}
+            title={
+              hasChanges
+                ? 'Save your changes first. The backtest runs the saved file.'
+                : 'Test this strategy on historical data'
+            }
+          >
+            <FlaskConical className="h-4 w-4 mr-2" />
+            Backtest
+          </Button>
           <Button variant="outline" size="sm" onClick={() => setIsFullscreen(true)}>
             <Maximize2 className="h-4 w-4" />
           </Button>
@@ -428,6 +445,15 @@ export default function EditPythonStrategy() {
         </CardHeader>
         <CardContent>{editorContent}</CardContent>
       </Card>
+
+      {strategyId && (
+        <BacktestDialog
+          open={backtestOpen}
+          onOpenChange={setBacktestOpen}
+          strategyId={strategyId}
+          strategyName={strategy.name}
+        />
+      )}
 
       {/* Keyboard Shortcuts */}
       <Card>

@@ -614,6 +614,120 @@ while True:
     time.sleep(1)
 ```
 
+## Backtesting a Strategy
+
+Every strategy uploaded at `/python` has a **Backtest** button (the flask icon
+on its card, and a Backtest button on its edit page). Choose a start date, an
+end date (the last 30 days by default, at most 366 days), the capital, the
+brokerage per order and the slippage, and press **Run backtest**. The results
+page shows the progress while it runs and, when it is done, the net P&L, return,
+trade count, win rate, profit factor, maximum drawdown, Sharpe ratio and total
+costs, with the equity curve, the drawdown, the daily P&L, every trade and the
+last lines your script printed. Past runs of the same strategy are listed
+below, so you can compare one setting against another.
+
+### What it does
+
+- **Your script runs unchanged.** It runs as its own process, as it does live,
+  from a copy in `strategies/backtests/<strategy>/<run>/`. Any file it writes
+  beside itself (a journal, a state file) lands there, never beside the live
+  script. A backtest does not stop, start or change the live strategy, its
+  schedule or its files, and it can run while the live strategy is running.
+- **Time is simulated.** `datetime.now()`, `date.today()`, `time.time()`,
+  `time.monotonic()`, `time.sleep()` and `pd.Timestamp.now()` (and `today()`,
+  `utcnow()`) follow a clock that starts at the open of the strategy's exchange
+  on the first day of the period. A `time.sleep(15)` moves it on 15 seconds.
+  Nights, weekends and days with no data are skipped, so a sleep after the close
+  wakes the script at the next open. `datetime.now()` returns IST, as it does on
+  an Indian server. The script is stopped when the clock passes the close of the
+  last day.
+- **Two clocks are not simulated:** `numpy.datetime64("now")` and
+  `pd.Timestamp("now")` (the text form) still read the real time. Use
+  `datetime.now()` or `pd.Timestamp.now()` in a strategy you want to backtest.
+
+  | Exchange of the strategy | Session the clock follows |
+  |--------------------------|---------------------------|
+  | NSE, BSE, NFO, BFO | 09:15 to 15:30 |
+  | CDS, BCD | 09:00 to 17:00 |
+  | MCX | 09:00 to 23:30 |
+  | NCDEX | 09:00 to 17:00 |
+
+- **Orders stay inside the backtest.** `from openalgo import api` gives the
+  script a simulated broker. Orders, positions, the order book, the trade book
+  and funds all live inside the backtest, `analyzerstatus()` reports the mode
+  `backtest`, and `telegram()` sends nothing.
+- **The script cannot reach OpenAlgo itself.** While it runs, every connection
+  from the backtest process to the OpenAlgo app is refused (whichever library
+  makes it), starting another program is refused, and importing OpenAlgo's own
+  code (`services`, `database`, `broker` and the rest) is refused. The script
+  sees a stand-in API key, not yours; only the part of the backtest that reads
+  history holds the real one. Other sites, such as an LLM provider, stay
+  reachable. These protections cover every ordinary way a script makes a
+  request, starts a program or imports a module. They are not a sandbox against
+  code written on purpose to get around them, which nothing inside Python can
+  be: backtest only scripts you would trust to run live.
+- **No look-ahead.** `history()` returns the bars up to the simulated moment,
+  including the bar still forming, exactly as a broker does live. A forming bar
+  holds only what had traded by then. `quotes()` returns the last traded price
+  of the moment.
+
+### How orders fill
+
+| Order | Fill |
+|-------|------|
+| MARKET | At once, at the price of the moment, moved against you by the slippage |
+| LIMIT | When a later one-minute bar trades through the limit: at the limit, or at that bar's open if it opened beyond it |
+| SL-M | When a bar trades through the trigger: at the trigger, or at the open if the bar gapped past it, plus slippage |
+| SL | Triggers like SL-M, then fills as a LIMIT at its price |
+
+`placesmartorder` trades the difference between the open position and
+`position_size`, by the same rules as live. MIS positions are squared off at
+the square-off times set on the Sandbox page (by default 15:15 for NSE, BSE and
+F&O, 16:45 for currency, 23:30 for MCX and 17:00 for NCDEX), and MIS orders
+after that time are rejected. Positions still open at the end of the period are
+closed at the last price. MIS orders need a fifth of their value free in
+capital, other products their full value.
+
+### Costs
+
+Per executed order: brokerage of the amount you enter (20 by default) or 0.03%
+of the order value, whichever is lower; STT of 0.025% of the value on sells;
+and 0.005% of the value for exchange, regulator and stamp charges. This is a
+simple model close to intraday equity; delivery and F&O charges are higher.
+
+### Data
+
+The backtest reads one-minute bars from **Historify** first and asks your
+broker for whatever Historify does not have, a few weeks at a time. Fifteen
+days before the start date are loaded as well, so indicators have history to
+warm up on, and 120 days of daily bars. Download the symbols into Historify
+for the fastest and most complete runs; data from the broker needs a broker
+login and is limited to what the broker keeps. Finished periods are cached on
+disk, so running the same period again starts at once. If there is no data
+for the symbol the strategy trades, the run ends with a message saying so.
+
+### Limitations
+
+- WebSocket streaming (`connect`, `subscribe_ltp` and the rest) is not
+  available; those calls report that they did not connect. Strategies that
+  rely only on streaming cannot be backtested.
+- Fills come from one-minute bars, so a stop and a target touched in the same
+  minute cannot be ordered, and a fill never improves on the bar's own prices.
+  There is no order book depth, partial fill or queue position.
+- Option chains, Greeks and other options services are not simulated.
+- **Results are unreliable for a strategy that relies on its own threads.**
+  Threads see the simulated clock, but the clock only moves when the main loop
+  sleeps, so a background thread's timing does not match what would happen live.
+- A run may take at most 60 minutes. A strategy that never sleeps between
+  cycles is stopped with a message saying so. A strategy that prints on every cycle
+  prints thousands of lines a simulated day; the log keeps the first 8 MB and
+  the last 2,000 lines.
+- The SMC example (`smc_llm_levels_ob.py`) does not call the LLM in a
+  backtest. It takes every valid trigger with its mechanical plan instead, so a
+  backtest costs nothing in model fees. Set `SMC_BACKTEST_LLM = 'true'` in
+  `.env` to backtest with the real model, which calls it for every trigger in
+  the period.
+
 ## Best Practices
 
 ### 1. Always Test in Analyzer Mode

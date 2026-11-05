@@ -563,6 +563,16 @@ def react_python_guide():
     return serve_react_app()
 
 
+@react_bp.route("/python/backtest/<strategy_id>", strict_slashes=False)
+def react_python_backtest_history(strategy_id):
+    return serve_react_app()
+
+
+@react_bp.route("/python/backtest/<strategy_id>/<run_id>", strict_slashes=False)
+def react_python_backtest(strategy_id, run_id):
+    return serve_react_app()
+
+
 # Chartink Strategies
 # Note: Using strict_slashes=False to handle both /chartink and /chartink/
 @react_bp.route("/chartink", strict_slashes=False)

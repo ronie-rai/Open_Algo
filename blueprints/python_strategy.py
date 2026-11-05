@@ -47,6 +47,7 @@ from database.market_calendar_db import (
     is_market_holiday,
     is_market_open,
 )
+from services.python_backtest import manager as backtest_manager
 from utils import runtime, stream_registry
 from utils.constants import CRYPTO_EXCHANGES
 from utils.db_sessions import releases_scoped_sessions
@@ -296,6 +297,7 @@ def _run_market_hours_enforcer():
 @releases_scoped_sessions
 def _run_dead_process_reaper():
     cleanup_dead_processes()
+    backtest_manager.reap()
 
 
 @releases_scoped_sessions
@@ -3505,6 +3507,145 @@ def save_strategy(strategy_id):
         return jsonify({"status": "error", "message": f"Failed to save: {str(e)}"}), 500
 
 
+# =============================================================================
+# BACKTEST
+# =============================================================================
+# A strategy is replayed, unchanged, against historical bars in a subprocess of
+# its own (services/python_backtest). The request only launches it; the page
+# polls for progress and the result. A backtest never touches the live
+# strategy's process, schedule or files: it runs from a copy of the script in
+# its own run directory.
+
+
+def _backtest_data_host() -> str:
+    """Where the backtest reads history from: the same resolution MCP uses."""
+    for candidate in (os.getenv("MCP_LOOPBACK_URL"), os.getenv("HOST_SERVER")):
+        if candidate and candidate.strip():
+            return candidate.strip().rstrip("/")
+    return f"http://127.0.0.1:{os.getenv('FLASK_PORT', '5000')}"
+
+
+def _sandbox_square_off_times() -> dict:
+    """The MIS square-off times set on the Sandbox page, so a backtest closes when the sandbox does.
+
+    Read only; the runner falls back to the sandbox defaults for anything missing.
+    """
+    times = {}
+    try:
+        from database.sandbox_db import get_config
+        from services.python_backtest.sessions import SQUARE_OFF_SETTINGS
+
+        for key in SQUARE_OFF_SETTINGS:
+            value = get_config(key)
+            if value:
+                times[key] = str(value)
+    except Exception:
+        logger.exception("Could not read the sandbox square-off times for a backtest")
+    return times
+
+
+def _backtest_owner_check(strategy_id):
+    """(config, None) for the session's own strategy, else (None, error response)."""
+    user_id = session.get("user")
+    if not user_id:
+        return None, (jsonify({"status": "error", "message": "Session expired"}), 401)
+    if not backtest_manager.valid_strategy_id(strategy_id):
+        return None, (jsonify({"status": "error", "message": "Invalid strategy ID"}), 400)
+    ok, result = verify_strategy_ownership(strategy_id, user_id, return_config=True)
+    if not ok:
+        return None, result
+    return result, None
+
+
+@python_strategy_bp.route("/api/backtest/<strategy_id>", methods=["POST"])
+@check_session_validity
+def api_start_backtest(strategy_id):
+    """Start a backtest of a strategy. Returns at once with the run id."""
+    config, error = _backtest_owner_check(strategy_id)
+    if error:
+        return error
+
+    params, message = backtest_manager.validate_request(request.get_json(silent=True) or {})
+    if params is None:
+        return jsonify({"status": "error", "message": message}), 400
+
+    file_path = Path(config.get("file_path") or (STRATEGIES_DIR / config.get("file_name", "")))
+    api_key = None
+    try:
+        from database.auth_db import get_api_key_for_tradingview
+
+        api_key = get_api_key_for_tradingview(config.get("user_id") or session.get("user"))
+    except Exception:
+        logger.exception(f"Could not read the API key for a backtest of {strategy_id}")
+
+    env = apply_strategy_limits_env({})
+    ok, payload, code = backtest_manager.start(
+        strategy_id=strategy_id,
+        strategy_name=config.get("name", strategy_id),
+        script_path=file_path,
+        exchange=normalize_exchange(config.get("exchange")),
+        params=params,
+        api_key=api_key or "",
+        host=_backtest_data_host(),
+        python_executable=get_python_executable(),
+        extra_env=env,
+        square_off_times=_sandbox_square_off_times(),
+    )
+    if not ok:
+        return jsonify({"status": "error", "message": payload}), code
+    return jsonify({"status": "success", "message": "Backtest started", "data": payload})
+
+
+@python_strategy_bp.route("/api/backtest/<strategy_id>", methods=["GET"])
+@check_session_validity
+def api_list_backtests(strategy_id):
+    """Past and current backtests of a strategy, newest first."""
+    config, error = _backtest_owner_check(strategy_id)
+    if error:
+        return error
+    return jsonify(
+        {
+            "status": "success",
+            "data": {
+                "strategy_name": config.get("name", strategy_id),
+                "active_run_id": backtest_manager.active_run_id(strategy_id),
+                "runs": backtest_manager.list_runs(strategy_id),
+            },
+        }
+    )
+
+
+@python_strategy_bp.route("/api/backtest/<strategy_id>/<run_id>", methods=["GET"])
+@check_session_validity
+def api_backtest_status(strategy_id, run_id):
+    """One run: its progress while it runs, its results once it is done."""
+    config, error = _backtest_owner_check(strategy_id)
+    if error:
+        return error
+    if not backtest_manager.valid_run_id(run_id):
+        return jsonify({"status": "error", "message": "Backtest not found"}), 404
+    data = backtest_manager.status(strategy_id, run_id)
+    if data is None:
+        return jsonify({"status": "error", "message": "Backtest not found"}), 404
+    data["strategy_name"] = config.get("name", strategy_id)
+    return jsonify({"status": "success", "data": data})
+
+
+@python_strategy_bp.route("/api/backtest/<strategy_id>/<run_id>/stop", methods=["POST"])
+@check_session_validity
+def api_stop_backtest(strategy_id, run_id):
+    """Stop a running backtest; it keeps the results of the time it ran."""
+    _config, error = _backtest_owner_check(strategy_id)
+    if error:
+        return error
+    if not backtest_manager.valid_run_id(run_id):
+        return jsonify({"status": "error", "message": "Backtest not found"}), 404
+    ok, message = backtest_manager.stop(strategy_id, run_id)
+    if not ok:
+        return jsonify({"status": "error", "message": message}), 404
+    return jsonify({"status": "success", "message": message})
+
+
 # Cleanup on shutdown
 def cleanup_on_exit():
     """Clean up all running processes on application exit"""
@@ -3517,6 +3658,10 @@ def cleanup_on_exit():
         _SHUTTING_DOWN.set()
         strategy_ids = list(RUNNING_STRATEGIES.keys())
     keep_record = _SHUTDOWN_KEEPS_RECORDS.is_set()
+    try:
+        backtest_manager.stop_all()
+    except Exception:
+        logger.exception("Could not stop the running backtests")
     for strategy_id in strategy_ids:
         try:
             if keep_record:
@@ -3669,6 +3814,10 @@ def _shutdown_hook() -> None:
     """
     if runtime.gthread_active():
         begin_shutdown()
+        try:
+            backtest_manager.stop_all()
+        except Exception:
+            logger.exception("Could not stop the running backtests")
 
 
 # Register cleanup handler

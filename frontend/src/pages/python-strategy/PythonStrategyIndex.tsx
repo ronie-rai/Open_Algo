@@ -5,6 +5,7 @@ import {
   Download,
   FileCode,
   FileText,
+  FlaskConical,
   HelpCircle,
   MoreVertical,
   Pencil,
@@ -46,6 +47,7 @@ import {
   STATUS_LABELS,
 } from '@/types/python-strategy'
 import { showToast } from '@/utils/toast'
+import { BacktestDialog } from './BacktestDialog'
 
 /**
  * The schedule as a trader reads it. A strategy saved with no stop time is a
@@ -69,6 +71,7 @@ export default function PythonStrategyIndex() {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [strategyToDelete, setStrategyToDelete] = useState<PythonStrategy | null>(null)
   const [currentTime, setCurrentTime] = useState(new Date())
+  const [backtestTarget, setBacktestTarget] = useState<PythonStrategy | null>(null)
 
   const fetchData = async (silent = false) => {
     try {
@@ -554,6 +557,20 @@ export default function PythonStrategyIndex() {
 
                   <Tooltip>
                     <TooltipTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        aria-label={`Backtest ${strategy.name}`}
+                        onClick={() => setBacktestTarget(strategy)}
+                      >
+                        <FlaskConical className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Backtest on historical data</TooltipContent>
+                  </Tooltip>
+
+                  <Tooltip>
+                    <TooltipTrigger asChild>
                       <Button variant="outline" size="sm" asChild>
                         <Link to={`/python/${strategy.id}/logs`}>
                           <FileText className="h-4 w-4" />
@@ -578,6 +595,17 @@ export default function PythonStrategyIndex() {
             </Card>
           ))}
         </div>
+      )}
+
+      {backtestTarget && (
+        <BacktestDialog
+          open={backtestTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setBacktestTarget(null)
+          }}
+          strategyId={backtestTarget.id}
+          strategyName={backtestTarget.name}
+        />
       )}
 
       {/* Delete Dialog */}

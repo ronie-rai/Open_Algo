@@ -6,6 +6,35 @@ Each release adds a stanza here summarising what changed and who contributed.
 The full notes for a release, with commit SHAs and the reasoning behind each
 fix, live in [docs/releases](releases/).
 
+## [Unreleased]
+
+### Added
+
+- **Backtest a Python strategy in one click.** Every strategy at `/python` has a
+  Backtest button. The script runs unchanged against historical one-minute bars
+  (Historify first, then the broker) on a simulated clock, with a simulated
+  broker that never reaches the real one. The results page shows net P&L,
+  return, win rate, profit factor, drawdown, Sharpe, costs, the equity and
+  drawdown curves, daily P&L, every trade and the script's log, and keeps the
+  last 20 runs of each strategy. A run never touches the live strategy, its
+  schedule or its files.
+- While a backtest runs, the script cannot connect to the OpenAlgo app, start
+  another program or import OpenAlgo's own code, and it sees a stand-in API key
+  rather than yours. These cover every ordinary way of doing those things; they
+  are not a sandbox against code written to get around them, so backtest only
+  scripts you would trust to run live.
+- Costs are a simple intraday equity model (brokerage per order or 0.03%,
+  whichever is lower, STT on sells and exchange charges) with slippage you set.
+  MIS positions close at the square-off times set on the Sandbox page. Fills
+  come from one-minute bars; WebSocket streaming and options services are not
+  available inside a backtest, `numpy.datetime64("now")` reads the real clock,
+  and results are unreliable for strategies that rely on their own threads. See
+  the user guide, chapter 20.
+- The SMC LLM example does not call the model during a backtest unless
+  `SMC_BACKTEST_LLM` is set; it takes every valid trigger mechanically instead.
+- No database migration. Runs and the data cache live in
+  `strategies/backtests/`, which is ignored by git.
+
 ## [2.0.3.1] - 2026-10-30
 
 ### Security Fixes and Fyers Live Data Release
