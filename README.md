@@ -478,4 +478,5 @@ Always test your strategies in Analyzer Mode before deploying with real money. P
 
 Built with by traders, for traders. Making algorithmic trading accessible to everyone.
 #   O p e n _ A l g o  
+ #   O p e n _ A l g o  
  
