@@ -29,6 +29,9 @@ from services.python_backtest.sessions import date_to_day, session_for
 
 REPO = Path(__file__).resolve().parent.parent
 EXAMPLES = REPO / "strategies" / "examples"
+# Upstream copies of example strategies, so these tests do not depend on what a
+# user keeps in their own examples folder.
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "backtest"
 
 
 def write_bars(directory: Path, symbol: str, exchange: str, start: date, end: date, base, seed):
@@ -109,9 +112,9 @@ def run_backtest(
 
 @pytest.mark.timeout(400)
 def test_simple_ema_strategy_runs_unchanged_and_trades(tmp_path, data_dir):
-    original = (EXAMPLES / "simple_ema_strategy.py").read_bytes()
+    original = (FIXTURES / "simple_ema_strategy.py").read_bytes()
     run_dir, result, log = run_backtest(
-        tmp_path, EXAMPLES / "simple_ema_strategy.py", data_dir, "2026-09-15", "2026-09-17"
+        tmp_path, FIXTURES / "simple_ema_strategy.py", data_dir, "2026-09-15", "2026-09-17"
     )
     assert result["status"] == "completed", result.get("message")
     m = result["metrics"]
@@ -129,7 +132,7 @@ def test_simple_ema_strategy_runs_unchanged_and_trades(tmp_path, data_dir):
     assert all(o["order_status"] != "open" for o in result["orders"])
     assert "Starting 5/10 EMA Crossover Strategy" in log
     assert json.loads((run_dir / "progress.json").read_text())["status"] == "finished"
-    assert (EXAMPLES / "simple_ema_strategy.py").read_bytes() == original
+    assert (FIXTURES / "simple_ema_strategy.py").read_bytes() == original
 
 
 @pytest.mark.timeout(400)

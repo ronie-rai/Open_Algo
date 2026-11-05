@@ -24,10 +24,14 @@ How it trades
              target = the MIDPOINT of the nearest (highest) bullish FVG below
                       entry whose midpoint has not been reached since it formed
 
-     The nearest stop at least MIN_STOP_ATR x ATR(14) away is used, then the
-     nearest target paying at least MIN_RR times that risk. If there is no
-     valid stop or no valid target, the signal is skipped and the reason is
-     logged and journalled.
+     Stop: candidates are taken nearest to entry first, and the first one at
+     least MIN_STOP_ATR x ATR(14) away from entry is the stop. A nearer one
+     that is too tight is passed over, never widened.
+     Target: candidates are taken nearest to entry first, and the first one
+     paying at least MIN_RR times that stop distance is the target. It is not
+     the gap with the best reward:risk, only the nearest one that is enough.
+     If there is no valid stop or no valid target, the signal is skipped and
+     the reason is logged and journalled.
   5. Quantity: min(floor(MAX_LOSS_PER_TRADE / stop distance),
      floor(CAPITAL / entry)), rounded down to the lot size, with no leverage.
      Both prices are padded by SIZING_BUFFER_PCT first so a little slippage
@@ -39,7 +43,18 @@ How it trades
      and square-off at SQUARE_OFF. An exit always cancels the broker stop first
      and closes with placesmartorder to a position of zero, so it never
      reverses a position.
-  7. After an exit caused by a flip, the flip is itself a fresh signal. With
+  7. Entry window: a signal is judged by the close time of its bar. A bar
+     closing between ENTRY_START and LAST_ENTRY (09:30 - 14:45) may trade, so
+     the 14:40 - 14:45 bar still trades when it is processed a few seconds
+     after 14:45. No entry is ever placed more than ENTRY_GRACE_SEC (2 minutes)
+     after LAST_ENTRY, nor before ENTRY_START.
+  8. Daily caps: MAX_TRADES_PER_DAY entries, and no new entry once the day's
+     realised loss reaches MAX_DAILY_LOSS. The loss counted is from fill
+     prices: the entry fill, and the exit, stop or (when the position was
+     already flat) the latest closing fill in the trade book, falling back to
+     the LTP. Brokerage, taxes and positions not opened by this script are
+     not counted.
+  9. After an exit caused by a flip, the flip is itself a fresh signal. With
      ENTER_ON_FLIP on, the opposite trade is considered only once the broker
      reports the position flat, and it goes through every normal check (entry
      window, daily caps, a valid stop and target) as a separate new order.
@@ -67,6 +82,30 @@ Definitions (all evaluated with bars up to the last closed bar only)
   low to high. It counts as unmitigated until a later bar trades back into
   the zone. Only blocks lying entirely on the protective side of entry are
   used, and only for the stop.
+
+Order safety
+  - A position that cannot be read is treated as unknown, never as flat. While
+    an entry is being confirmed, or any position is unknown or not managed
+    here, no entry is made on any symbol.
+  - An order call with no clear answer may still have reached the broker, so
+    it is never taken as a refusal. A lost entry answer is resolved from the
+    position and the order book before anything else; a filled entry is taken
+    over and given its stop. A lost stop answer is looked up in the order book
+    before the SL fallback is sent, so there is never more than one stop.
+  - An exit never sends a second closing order while the first may still be
+    working: the earlier exit order is cancelled and confirmed final first,
+    and a lost exit answer is resolved from the order book. The order book is
+    account-wide, so a closing order in the same symbol placed by hand is
+    cancelled too.
+  - If state.json cannot be read, it is kept aside with a timestamp. A
+    position found at the broker in a configured symbol is then taken over
+    and closed at market (its stop and target cannot be rebuilt), after any
+    closing order still working in that symbol is cancelled. Its P&L is not
+    counted. If state.json is fine, a position this script did not open is
+    left alone and blocks new entries until it is flat.
+  - A symbol the app says does not exist is skipped. One that could not be
+    checked (OpenAlgo unreachable, broker not logged in) is checked again
+    every bar and only traded once it is confirmed.
 
 Setup
   - Edit the CONFIG block below, or override any value with an STFVG_* entry
@@ -189,6 +228,7 @@ HISTORY_DAYS = 12  # calendar days of 5m bars, so ATR and Supertrend are warmed 
 HISTORY_PAUSE_SEC = 0.3  # between history calls, for the broker's rate limit
 POLL_SECONDS = 10
 ENTRY_TIMEOUT_SEC = 60  # an entry order not final by then is cancelled
+ENTRY_GRACE_SEC = 120  # a signal from the LAST_ENTRY bar may still be entered this long after
 TELEGRAM_USER = _env("STFVG_TELEGRAM_USER", "")  # your OpenAlgo login name, optional
 
 API_KEY = os.getenv("OPENALGO_API_KEY")
@@ -619,10 +659,14 @@ def plan_trade(symbol, side, bars, entry, tick=0.05, lot=1):
 # =============================================================================
 # STRATEGY
 # =============================================================================
+FINAL = ("complete", "rejected", "cancelled")
+
+
 class SupertrendFvgStrategy:
     def __init__(self, client, symbols=None, clock=now_ist, data_dir=DATA_DIR, pause=None):
         self.client = client
         self.symbols = list(symbols if symbols is not None else SYMBOLS)
+        self.unchecked = []  # symbols whose existence could not be checked yet
         self.clock = clock
         self.pause = HISTORY_PAUSE_SEC if pause is None else pause
         data_dir = Path(data_dir)
@@ -634,7 +678,8 @@ class SupertrendFvgStrategy:
         self.bar_done = {}  # symbol -> closed bar processed for it this cycle
         self.last_seen_bar = {}  # symbol -> timestamp of the last closed bar evaluated
         self.trend = {}  # symbol -> current Supertrend direction
-        self.untracked = set()  # symbols with a position this strategy does not manage
+        self.untracked = set()  # symbols with a position not managed here, or unreadable
+        self.state_lost = False  # the state file existed but could not be read
         self.state = self._load_state()
 
     # ---------- persistence ----------
@@ -652,7 +697,22 @@ class SupertrendFvgStrategy:
         day = self.clock().date().isoformat()
         try:
             state = json.loads(self.state_path.read_text())
+            if not isinstance(state, dict):
+                raise ValueError("state is not an object")
+        except FileNotFoundError:
+            return self._fresh_day(day)
         except (OSError, ValueError):
+            self.state_lost = True
+            aside = self.state_path.with_name(f"state.unreadable-{self.clock():%Y%m%d-%H%M%S}.json")
+            try:
+                self.state_path.replace(aside)
+                where = f"kept aside as {aside.name}"
+            except OSError:
+                where = "it could not be moved aside"
+            log(
+                f"the saved state could not be read ({where}); positions found at the broker "
+                "in the configured symbols are closed at market on start"
+            )
             return self._fresh_day(day)
         if state.get("date") != day:
             return self._fresh_day(day, state)
@@ -677,6 +737,11 @@ class SupertrendFvgStrategy:
 
     # ---------- broker helpers ----------
     def call(self, method, quiet=False, **kwargs):
+        """The response, or None when the call failed or answered with an error.
+
+        None says nothing about whether an order reached the broker: an order
+        call that returns None may still have been placed.
+        """
         try:
             resp = getattr(self.client, method)(**kwargs)
         except Exception as e:
@@ -700,6 +765,7 @@ class SupertrendFvgStrategy:
             return None
 
     def position_qty(self, symbol):
+        """Signed net quantity, or None when it could not be read (never "flat")."""
         resp = self.call(
             "openposition",
             strategy=STRATEGY_NAME,
@@ -712,13 +778,82 @@ class SupertrendFvgStrategy:
         except (TypeError, KeyError, ValueError):
             return None
 
-    def order_status(self, order_id):
+    def order_info(self, order_id):
+        """(status, average price, quantity) of an order; status None when unreadable."""
         resp = self.call("orderstatus", order_id=order_id, strategy=STRATEGY_NAME)
         try:
             data = resp["data"]
-            return str(data.get("order_status", "")).lower(), float(data.get("average_price") or 0)
+            status = str(data.get("order_status", "")).lower() or None
+            avg = float(data.get("average_price") or 0)
+            qty = int(float(data.get("quantity") or 0))
+            return status, avg, qty
         except (TypeError, KeyError, ValueError, AttributeError):
-            return None, 0.0
+            return None, 0.0, 0
+
+    def order_status(self, order_id):
+        status, avg, _qty = self.order_info(order_id)
+        return status, avg
+
+    def open_orders(self, symbol):
+        """Orders still working at the broker in `symbol`, or None if the order book
+        could not be read. The order book is account-wide."""
+        resp = self.call("orderbook")
+        if not isinstance(resp, dict):
+            return None
+        data = resp.get("data")
+        orders = data.get("orders") if isinstance(data, dict) else data
+        if orders is None:
+            orders = []
+        if not isinstance(orders, list):
+            return None
+        working = []
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            if str(o.get("symbol", "")).upper() != symbol.upper():
+                continue
+            if str(o.get("exchange") or EXCHANGE).upper() != EXCHANGE.upper():
+                continue
+            if str(o.get("product") or PRODUCT).upper() != PRODUCT.upper():
+                continue
+            if str(o.get("order_status", "")).lower() in FINAL:
+                continue
+            working.append(o)
+        return working
+
+    def cancel_orders(self, orders):
+        """Cancel each order and wait until it is final. True when all of them are."""
+        for o in orders:
+            oid = o.get("orderid")
+            if not oid:
+                return False
+            self.call("cancelorder", order_id=oid, strategy=STRATEGY_NAME)
+            status, _avg = self.wait_final(oid, timeout=10)
+            if status not in FINAL:
+                log(f"order {oid} could not be cancelled ({status}); trying again next cycle")
+                return False
+        return True
+
+    def book_fill_price(self, symbol, action):
+        """Average price of the latest fill in `symbol` on `action`, from the trade book."""
+        resp = self.call("tradebook", quiet=True)
+        data = (resp or {}).get("data") if isinstance(resp, dict) else None
+        if not isinstance(data, list):
+            return None
+        for row in reversed(data):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("symbol", "")).upper() != symbol.upper():
+                continue
+            if str(row.get("action", "")).upper() != action:
+                continue
+            try:
+                price = float(row.get("average_price") or 0)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                return price
+        return None
 
     def place(self, symbol, action, qty, price_type="MARKET", price=0, trigger_price=0):
         resp = self.call(
@@ -740,34 +875,21 @@ class SupertrendFvgStrategy:
         status, avg = None, 0.0
         while time.monotonic() < deadline:
             status, avg = self.order_status(order_id)
-            if status in ("complete", "rejected", "cancelled"):
+            if status in FINAL:
                 break
             time.sleep(2)
         return status, avg
 
     # ---------- startup ----------
     def setup(self):
-        valid = []
-        for symbol in self.symbols:
-            try:
-                info = self.client.symbol(symbol=symbol, exchange=EXCHANGE)
-            except Exception:
-                info = None
-            data = info.get("data") if isinstance(info, dict) else None
-            if not (isinstance(info, dict) and info.get("status") == "success" and data):
-                log(f"{symbol} is not in the {EXCHANGE} symbol list; it is skipped")
-                continue
-            try:
-                tick = float(data.get("tick_size") or 0.05)
-                lot = int(float(data.get("lotsize") or 1))
-            except (TypeError, ValueError):
-                tick, lot = 0.05, 1
-            self.meta[symbol] = (tick, max(lot, 1))
-            valid.append(symbol)
-        self.symbols = valid
+        self.unchecked, self.symbols = list(self.symbols), []
+        self.check_symbols()
         mode = self.call("analyzerstatus")
         mode_name = ((mode or {}).get("data") or {}).get("mode", "unknown")
-        log(f"{STRATEGY_NAME}: {len(valid)} symbols on {EXCHANGE} {PRODUCT}: {', '.join(valid)}")
+        log(
+            f"{STRATEGY_NAME}: {len(self.symbols)} symbols on {EXCHANGE} {PRODUCT}: "
+            f"{', '.join(self.symbols)}"
+        )
         log(
             f"Supertrend {ST_PERIOD}/{ST_MULTIPLIER} {ST_SOURCE} changeATR={ST_CHANGE_ATR}, "
             f"FVG {FVG_MODE}, capital Rs {CAPITAL:.0f}, max loss Rs {MAX_LOSS_PER_TRADE:.0f}/trade"
@@ -775,13 +897,47 @@ class SupertrendFvgStrategy:
         log(f"OpenAlgo mode: {mode_name}  (analyze = sandbox orders, live = real orders)")
         self.reconcile()
 
+    def check_symbols(self):
+        """Confirm symbols against the master contract. A symbol the app says does
+        not exist is dropped; one that could not be checked is tried again later."""
+        still, added = [], []
+        for symbol in self.unchecked:
+            try:
+                info = self.client.symbol(symbol=symbol, exchange=EXCHANGE)
+            except Exception:
+                info = None
+            data = info.get("data") if isinstance(info, dict) else None
+            if (
+                isinstance(info, dict)
+                and info.get("status") == "success"
+                and isinstance(data, dict)
+            ):
+                try:
+                    tick = float(data.get("tick_size") or 0.05)
+                    lot = int(float(data.get("lotsize") or 1))
+                except (TypeError, ValueError):
+                    tick, lot = 0.05, 1
+                self.meta[symbol] = (tick, max(lot, 1))
+                self.symbols.append(symbol)
+                added.append(symbol)
+            elif isinstance(info, dict) and "not found" in str(info.get("message", "")).lower():
+                log(f"{symbol} is not in the {EXCHANGE} symbol list; it is skipped")
+            else:
+                still.append(symbol)
+        if still:
+            log(
+                f"could not check {', '.join(still)}: OpenAlgo could not be reached, or the "
+                "broker is not logged in. They are checked again every bar and are not "
+                "traded until then"
+            )
+        self.unchecked = still
+        return added
+
     def reconcile(self):
         """Make the saved state agree with the broker's positions."""
-        trade = self.state.get("open")
-        pending = self.state.get("pending")
-        if pending:
+        if self.state.get("pending"):
             self.manage_pending(self.clock(), force=True)
-            trade = self.state.get("open")
+        trade = self.state.get("open")
         if trade:
             qty = self.position_qty(trade["symbol"])
             if qty == 0:
@@ -790,22 +946,71 @@ class SupertrendFvgStrategy:
                     "clearing it (P&L not recorded)"
                 )
                 self.state["open"] = None
-            elif qty is not None:
+                trade = None
+            elif qty is None:
+                log(
+                    f"could not read the {trade['symbol']} position; still managing the saved trade"
+                )
+            else:
                 trade["qty"] = abs(qty)
                 log(
                     f"resuming {trade['side']} {abs(qty)} {trade['symbol']} @ {trade['entry_price']}"
                 )
-        for symbol in self.symbols:
-            if trade and symbol == trade["symbol"]:
+        self.check_positions(self.symbols)
+        self._save_state()
+
+    def check_positions(self, symbols):
+        """Note positions this strategy is not managing. After a lost state file, the
+        first one found is taken over and closed at market."""
+        busy = {(self.state.get("open") or {}).get("symbol")}
+        busy.add(((self.state.get("pending") or {}).get("plan") or {}).get("symbol"))
+        for symbol in symbols:
+            if symbol in busy:
                 continue
             qty = self.position_qty(symbol)
-            if qty:
+            if qty == 0:
+                continue
+            if qty is None:
+                self.untracked.add(symbol)
+                log(f"{symbol}: could not read the position; no new entries until it can be read")
+            elif self.state_lost and not self.state.get("open"):
+                self.recover(symbol, qty)
+            else:
                 self.untracked.add(symbol)
                 log(
                     f"{symbol}: a position of {qty} exists that this strategy is not managing; "
                     "no new entries until it is flat"
                 )
+
+    def recover(self, symbol, qty):
+        """Take over a position left behind by a lost state file and close it.
+
+        Its stop and target cannot be rebuilt, so the safest course is to close it:
+        any working order in the closing direction (a stop left at the broker) is
+        cancelled first, then the position is closed to zero.
+        """
+        self.state["open"] = {
+            "symbol": symbol,
+            "side": "BUY" if qty > 0 else "SELL",
+            "qty": abs(qty),
+            "entry_price": self.ltp(symbol) or 0.0,
+            "stop": None,
+            "target": None,
+            "stop_order_id": None,
+            "stop_type": None,
+            "stop_check": True,  # look for and cancel any stop left at the broker
+            "exit_order_id": None,
+            "exit_unanswered": False,
+            "exit_retry": "recovered after the saved state was lost",
+            "recovered": True,
+            "opened": self.clock().isoformat(timespec="seconds"),
+        }
         self._save_state()
+        self.journal("recovered", symbol=symbol, qty=qty)
+        self.notify(
+            f"{symbol}: a position of {qty} was found after the saved state was lost; "
+            "closing it at market (its stop and target are unknown)"
+        )
 
     # ---------- market data ----------
     def load_bars(self, symbol, now):
@@ -855,26 +1060,37 @@ class SupertrendFvgStrategy:
             if self.on_bar(now, closed_bar):
                 self.last_bar_done = closed_bar
 
-    def can_enter(self, now):
+    def can_enter(self, now, bar_close=None):
+        """Whether a new entry may be placed now for a signal on the bar closing at
+        `bar_close` (default: judge the signal by `now`)."""
         s = self.state
         if s.get("open"):
             return False, f"a {s['open']['symbol']} trade is already open"
         if s.get("pending"):
-            return False, f"a {s['pending']['plan']['symbol']} entry order is pending"
-        secs = now.hour * 3600 + now.minute * 60 + now.second
-        if not hhmm(ENTRY_START) * 60 <= secs <= hhmm(LAST_ENTRY) * 60:
+            return False, f"a {s['pending']['plan']['symbol']} entry is being confirmed"
+        signal_at = bar_close or now
+        signal_secs = signal_at.hour * 3600 + signal_at.minute * 60 + signal_at.second
+        now_secs = now.hour * 3600 + now.minute * 60 + now.second
+        start, last = hhmm(ENTRY_START) * 60, hhmm(LAST_ENTRY) * 60
+        if not (start <= signal_secs <= last and start <= now_secs <= last + ENTRY_GRACE_SEC):
             return False, f"outside the entry window {ENTRY_START}-{LAST_ENTRY}"
         if s["trades"] >= MAX_TRADES_PER_DAY:
             return False, f"{MAX_TRADES_PER_DAY} trades already taken today"
         if s["pnl"] <= -MAX_DAILY_LOSS:
             return False, f"daily loss limit Rs {MAX_DAILY_LOSS:.0f} reached"
         if self.untracked:
-            return False, f"untracked positions in {', '.join(sorted(self.untracked))}"
+            return False, f"positions not managed here in {', '.join(sorted(self.untracked))}"
         return True, ""
 
     def on_bar(self, now, closed_bar):
         """Process one closed bar for every symbol. Returns False to retry the
         symbols whose bar has not arrived yet on the next poll."""
+        if self.unchecked:
+            added = self.check_symbols()
+            if added:
+                log(f"now trading {', '.join(added)} as well")
+                self.check_positions(added)
+                self._save_state()
         grace_over = now >= closed_bar + timedelta(minutes=BAR_MINUTES, seconds=60)
         signals, missing, waiting = [], [], False
         for n, symbol in enumerate(self.symbols):
@@ -882,23 +1098,28 @@ class SupertrendFvgStrategy:
                 continue
             if n:
                 time.sleep(self.pause)
-            bars = self.load_bars(symbol, now)
-            if bars is None or len(bars) < max(ST_PERIOD, RISK_ATR_PERIOD) + 5:
-                if grace_over:
-                    missing.append(symbol)
-                    self.bar_done[symbol] = closed_bar
-                else:
-                    waiting = True
+            try:
+                bars = self.load_bars(symbol, now)
+                if bars is None or len(bars) < max(ST_PERIOD, RISK_ATR_PERIOD) + 5:
+                    if grace_over:
+                        missing.append(symbol)
+                        self.bar_done[symbol] = closed_bar
+                    else:
+                        waiting = True
+                    continue
+                if bars.index[-1] < closed_bar and not grace_over:
+                    waiting = True  # the broker has not published the bar yet
+                    continue
+                self.bar_done[symbol] = closed_bar
+                signal = self.evaluate_symbol(symbol, bars)
+            except Exception as e:
+                self.bar_done[symbol] = closed_bar
+                log(f"{symbol}: its 5 minute bars could not be read this bar ({e}); skipped")
                 continue
-            if bars.index[-1] < closed_bar and not grace_over:
-                waiting = True  # the broker has not published the bar yet
-                continue
-            self.bar_done[symbol] = closed_bar
-            signal = self.evaluate_symbol(symbol, bars)
             if signal:
                 signals.append((symbol, signal, bars))
 
-        self.untracked = {s for s in self.untracked if self.position_qty(s)}
+        self.untracked = {s for s in self.untracked if self.position_qty(s) != 0}
         if signals:
             self.act_on_signals(now, signals)
         if waiting and not grace_over:
@@ -950,9 +1171,14 @@ class SupertrendFvgStrategy:
                 break
 
         for symbol, side, bars in ordered:
-            ok, why = self.can_enter(now)
-            if ok and self.position_qty(symbol):
-                ok, why = False, f"a position in {symbol} is already open at the broker"
+            bar_close = bars.index[-1].to_pydatetime() + timedelta(minutes=BAR_MINUTES)
+            ok, why = self.can_enter(now, bar_close)
+            if ok:
+                qty = self.position_qty(symbol)
+                if qty is None:
+                    ok, why = False, f"the {symbol} position could not be read"
+                elif qty:
+                    ok, why = False, f"a position in {symbol} is already open at the broker"
             if not ok:
                 log(f"{symbol} {side} signal ignored: {why}")
                 self.journal(
@@ -977,49 +1203,82 @@ class SupertrendFvgStrategy:
 
     # ---------- execution ----------
     def enter(self, plan, now):
+        """Place the entry and keep it as `pending` until the broker's answer is
+        confirmed. Every entry is blocked on every symbol while it is pending."""
         oid = self.place(plan.symbol, plan.side, plan.qty, "MARKET")
-        if not oid:
-            self.notify(f"{plan.symbol} {plan.side} entry order was refused; no trade")
-            return
-        self.state["trades"] += 1
         self.state["pending"] = {
             "order_id": oid,
             "plan": asdict(plan),
             "placed": now.isoformat(timespec="seconds"),
         }
         self._save_state()
-        status, avg = self.wait_final(oid)
-        if status in ("complete", "rejected", "cancelled"):
-            self.state["pending"] = None
-            qty = self.position_qty(plan.symbol)
-            if qty:
-                self.on_filled(plan, abs(qty), avg or self.ltp(plan.symbol) or plan.entry)
-            else:
-                self._save_state()
-                self.notify(f"{plan.symbol} entry order ended '{status}' with no position")
+        if not oid:
+            # The order may have reached the broker even though no answer came back.
+            log(
+                f"{plan.symbol} entry order got no clear answer; checking the position "
+                "and the order book before anything else"
+            )
+            time.sleep(3)
         else:
-            log(f"{plan.symbol} entry order is still '{status}'; checking again next cycle")
+            self.wait_final(oid)
+        self.manage_pending(now)
 
     def manage_pending(self, now, force=False):
         p = self.state["pending"]
         plan = Plan(**p["plan"])
-        status, avg = self.order_status(p["order_id"])
-        if status not in ("complete", "rejected", "cancelled"):
-            age = (now - datetime.fromisoformat(p["placed"])).total_seconds()
-            if not force and age < ENTRY_TIMEOUT_SEC:
+        oid = p.get("order_id")
+        status, avg, filled = None, 0.0, 0
+        if oid:
+            status, avg, filled = self.order_info(oid)
+            if status is None:
+                log(f"{plan.symbol} entry order status could not be read; checking again")
                 return
-            self.call("cancelorder", order_id=p["order_id"], strategy=STRATEGY_NAME)
-            status, avg = self.wait_final(p["order_id"], timeout=10)
-            if status not in ("complete", "rejected", "cancelled"):
-                log(f"{plan.symbol} entry order could not be cancelled ({status}); retrying")
-                return
-        self.state["pending"] = None
-        qty = self.position_qty(plan.symbol)  # covers a fill that raced the cancel
+            if status not in FINAL:
+                age = (now - datetime.fromisoformat(p["placed"])).total_seconds()
+                if not force and age < ENTRY_TIMEOUT_SEC:
+                    return
+                self.call("cancelorder", order_id=oid, strategy=STRATEGY_NAME)
+                status, avg = self.wait_final(oid, timeout=10)
+                if status not in FINAL:
+                    log(f"{plan.symbol} entry order could not be cancelled ({status}); retrying")
+                    return
+        qty = self.position_qty(plan.symbol)
+        if qty is None:
+            if status == "complete":
+                # The order filled in full; its quantity is the position.
+                done = filled or plan.qty
+                self.adopt_entry(plan, done if plan.side == "BUY" else -done, avg)
+            else:
+                log(f"{plan.symbol} position could not be read; the entry is checked again")
+            return
         if qty:
-            self.on_filled(plan, abs(qty), avg or self.ltp(plan.symbol) or plan.entry)
-        else:
+            self.adopt_entry(plan, qty, avg)
+            return
+        if not oid:
+            working = self.open_orders(plan.symbol)
+            if working is None:
+                log(f"{plan.symbol}: the order book could not be read; the entry is checked again")
+                return
+            entries = [o for o in working if str(o.get("action", "")).upper() == plan.side]
+            if entries:
+                self.cancel_orders(entries)
+                return  # checked again next cycle, a fill that raced the cancel included
+        self.state["pending"] = None
+        self._save_state()
+        self.notify(f"{plan.symbol} {plan.side} entry was not filled; no trade")
+        self.journal("entry_failed", symbol=plan.symbol, side=plan.side, status=status)
+
+    def adopt_entry(self, plan, qty, avg):
+        self.state["pending"] = None
+        if (qty > 0) != (plan.side == "BUY"):
+            self.untracked.add(plan.symbol)
             self._save_state()
-            self.notify(f"{plan.symbol} entry order ended '{status}' with no position")
+            self.notify(
+                f"{plan.symbol}: the position is {qty}, the opposite of the {plan.side} entry; "
+                "it is not managed here and no new entries are made until it is flat"
+            )
+            return
+        self.on_filled(plan, abs(qty), avg or self.ltp(plan.symbol) or plan.entry)
 
     def stop_order_prices(self, symbol, exit_action, stop, price_type):
         """(price_type, limit price) for a stop order at `stop`."""
@@ -1031,7 +1290,7 @@ class SupertrendFvgStrategy:
         return "SL", round_tick(limit, tick)
 
     def on_filled(self, plan, qty, fill):
-        exit_action = "SELL" if plan.side == "BUY" else "BUY"
+        self.state["trades"] += 1
         trade = {
             "symbol": plan.symbol,
             "side": plan.side,
@@ -1042,7 +1301,10 @@ class SupertrendFvgStrategy:
             "stop_source": plan.stop_source,
             "target_source": plan.target_source,
             "stop_order_id": None,
-            "stop_type": "SL-M",
+            "stop_type": None,
+            "stop_check": False,
+            "exit_order_id": None,
+            "exit_unanswered": False,
             "exit_retry": None,
             "opened": self.clock().isoformat(timespec="seconds"),
         }
@@ -1058,27 +1320,74 @@ class SupertrendFvgStrategy:
         self.notify(
             f"{plan.side} {qty} {plan.symbol} filled @ {fill:.2f}, SL {plan.stop}, TG {plan.target}"
         )
-
         gapped = fill <= plan.stop if plan.side == "BUY" else fill >= plan.stop
         if gapped:
             self.exit_trade("filled beyond the stop")
             return
+        self.place_stop(trade)
 
-        oid = self.place(plan.symbol, exit_action, qty, "SL-M", trigger_price=plan.stop)
-        if not oid:
-            _, limit = self.stop_order_prices(plan.symbol, exit_action, plan.stop, "SL")
-            oid = self.place(
-                plan.symbol, exit_action, qty, "SL", price=limit, trigger_price=plan.stop
-            )
-            trade["stop_type"] = "SL"
-        if oid:
-            trade["stop_order_id"] = oid
-        else:
-            self.notify(
-                f"{plan.symbol}: the broker refused the stop-loss order; "
-                "the stop is now watched by this script only"
-            )
+    def open_stops(self, trade):
+        working = self.open_orders(trade["symbol"])
+        if working is None:
+            return None
+        exit_action = "SELL" if trade["side"] == "BUY" else "BUY"
+        return [
+            o
+            for o in working
+            if str(o.get("action", "")).upper() == exit_action
+            and str(o.get("pricetype") or o.get("price_type") or "").upper() in ("SL", "SL-M")
+        ]
+
+    def adopt_stop(self, trade, found):
+        """Keep the first working stop found at the broker and cancel any other."""
+        keep = found[0]
+        if len(found) > 1:
+            self.cancel_orders(found[1:])
+        trade["stop_order_id"] = keep.get("orderid")
+        trade["stop_type"] = str(keep.get("pricetype") or keep.get("price_type") or "SL-M").upper()
+        trade["stop_check"] = False
         self._save_state()
+        log(f"{trade['symbol']}: the stop-loss order {trade['stop_order_id']} is working")
+
+    def place_stop(self, trade):
+        """Place the broker stop: SL-M, then SL. An order call with no clear answer
+        may still have been placed, so the order book is read before anything else
+        is sent: there is never more than one working stop."""
+        exit_action = "SELL" if trade["side"] == "BUY" else "BUY"
+        for price_type in ("SL-M", "SL"):
+            _, limit = self.stop_order_prices(
+                trade["symbol"], exit_action, trade["stop"], price_type
+            )
+            oid = self.place(
+                trade["symbol"],
+                exit_action,
+                trade["qty"],
+                price_type,
+                price=limit,
+                trigger_price=trade["stop"],
+            )
+            if oid:
+                trade.update(stop_order_id=oid, stop_type=price_type, stop_check=False)
+                self._save_state()
+                return
+            found = self.open_stops(trade)
+            if found is None:
+                trade["stop_check"] = True
+                self._save_state()
+                self.notify(
+                    f"{trade['symbol']}: could not confirm the stop-loss order; the stop is "
+                    "watched by this script and the order book is checked again next cycle"
+                )
+                return
+            if found:
+                self.adopt_stop(trade, found)
+                return
+        trade["stop_check"] = False
+        self._save_state()
+        self.notify(
+            f"{trade['symbol']}: the broker refused the stop-loss order; "
+            "the stop is now watched by this script only"
+        )
 
     def manage_open(self, now):
         trade = self.state["open"]
@@ -1098,6 +1407,12 @@ class SupertrendFvgStrategy:
         if trade.get("exit_retry"):
             self.exit_trade(trade["exit_retry"])
             return
+        if trade.get("stop_check"):
+            found = self.open_stops(trade)
+            if found:
+                self.adopt_stop(trade, found)
+            elif found is not None:
+                self.place_stop(trade)
         if minutes_of(now) >= hhmm(SQUARE_OFF):
             self.exit_trade("square-off time")
             return
@@ -1105,17 +1420,68 @@ class SupertrendFvgStrategy:
         if ltp is None:
             return
         long = trade["side"] == "BUY"
-        if (ltp >= trade["target"]) if long else (ltp <= trade["target"]):
+        if trade.get("target") is not None and (
+            (ltp >= trade["target"]) if long else (ltp <= trade["target"])
+        ):
             self.exit_trade("target")
-        elif not trade.get("stop_order_id") and (
-            (ltp <= trade["stop"]) if long else (ltp >= trade["stop"])
+        elif (
+            trade.get("stop") is not None
+            and not trade.get("stop_order_id")
+            and ((ltp <= trade["stop"]) if long else (ltp >= trade["stop"]))
         ):
             self.exit_trade("stop loss (script)")
 
     def exit_trade(self, reason):
-        """Close the open trade. Returns True once it is booked as closed."""
+        """Close the open trade. Returns True once it is booked as closed.
+
+        Never two closing orders at once: an earlier exit order is cancelled and
+        confirmed final first, a stop or exit order whose answer was lost is
+        looked up in the order book and cancelled, and the broker stop is
+        cancelled and confirmed before the position is closed to zero. Anything
+        that cannot be confirmed leaves the trade open and is retried next cycle.
+        """
         trade = self.state["open"]
         symbol = trade["symbol"]
+        exit_action = "SELL" if trade["side"] == "BUY" else "BUY"
+        trade["exit_retry"] = reason
+        self._save_state()
+
+        # 1. an earlier exit order of this trade
+        if trade.get("exit_order_id"):
+            oid = trade["exit_order_id"]
+            status, avg = self.order_status(oid)
+            if status is None:
+                log(f"{symbol}: the earlier exit order could not be read; retrying next cycle")
+                return False
+            if status not in FINAL:
+                self.call("cancelorder", order_id=oid, strategy=STRATEGY_NAME)
+                status, avg = self.wait_final(oid, timeout=10)
+                if status not in FINAL:
+                    log(f"{symbol}: the earlier exit order is still working; retrying next cycle")
+                    return False
+            trade["exit_order_id"] = None
+            if status == "complete" and avg:
+                trade["last_exit_avg"] = avg
+            self._save_state()
+
+        # 2. orders whose answer was lost: find and cancel them in the order book
+        if trade.get("stop_check") or trade.get("exit_unanswered"):
+            working = self.open_orders(symbol)
+            if working is None:
+                log(
+                    f"{symbol}: the order book could not be read, so the {reason} exit waits "
+                    "(an order sent earlier may still be working); retrying next cycle"
+                )
+                return False
+            closing = [o for o in working if str(o.get("action", "")).upper() == exit_action]
+            if trade.get("stop_order_id"):
+                closing = [o for o in closing if o.get("orderid") != trade["stop_order_id"]]
+            if not self.cancel_orders(closing):
+                return False
+            trade["stop_check"] = trade["exit_unanswered"] = False
+            self._save_state()
+
+        # 3. the broker stop
         if trade.get("stop_order_id"):
             self.call("cancelorder", order_id=trade["stop_order_id"], strategy=STRATEGY_NAME)
             status, avg = self.wait_final(trade["stop_order_id"], timeout=10)
@@ -1124,8 +1490,6 @@ class SupertrendFvgStrategy:
                 return True
             if status != "cancelled":
                 # Still live at the broker: exiting now as well could reverse the position
-                trade["exit_retry"] = reason
-                self._save_state()
                 log(
                     f"{symbol}: stop-loss order could not be cancelled ({status}); "
                     f"retrying the {reason} exit next cycle"
@@ -1133,21 +1497,26 @@ class SupertrendFvgStrategy:
                 return False
             trade["stop_order_id"] = None
             self._save_state()
+
+        # 4. the position
         qty = self.position_qty(symbol)
         if qty is None:
-            trade["exit_retry"] = reason
-            self._save_state()
             log(f"{symbol}: could not read the position; retrying the {reason} exit next cycle")
             return False
         if qty == 0:
-            self.close_book(self.ltp(symbol) or trade["entry_price"], reason + " (already flat)")
+            price = (
+                trade.pop("last_exit_avg", None)
+                or self.book_fill_price(symbol, exit_action)
+                or self.ltp(symbol)
+                or trade["entry_price"]
+            )
+            self.close_book(price, reason + " (already flat)")
             return True
-        exit_action = "SELL" if qty > 0 else "BUY"
         resp = self.call(
             "placesmartorder",
             strategy=STRATEGY_NAME,
             symbol=symbol,
-            action=exit_action,
+            action="SELL" if qty > 0 else "BUY",
             exchange=EXCHANGE,
             price_type="MARKET",
             product=PRODUCT,
@@ -1156,32 +1525,46 @@ class SupertrendFvgStrategy:
         )
         oid = (resp or {}).get("orderid")
         if not oid:
-            trade["exit_retry"] = reason
-            self._save_state()
-            self.notify(f"{symbol}: EXIT ORDER REFUSED ({reason}); position still open, will retry")
+            if resp is None:
+                # Refused, or sent with the answer lost: the order book decides next cycle.
+                trade["exit_unanswered"] = True
+                self._save_state()
+                self.notify(
+                    f"{symbol}: the exit order ({reason}) got no clear answer; the position is "
+                    "still managed and the order book is checked before trying again"
+                )
             return False
+        trade["exit_order_id"] = oid
+        self._save_state()
         _status, avg = self.wait_final(oid)
         left = self.position_qty(symbol)
-        if left:
-            trade["exit_retry"] = reason
-            trade["qty"] = abs(left)
-            self._save_state()
-            log(f"{symbol}: {abs(left)} still open after the exit order; retrying next cycle")
+        if left is None or left != 0:
+            what = "could not be read" if left is None else f"is still {left}"
+            log(f"{symbol}: after the exit order the position {what}; checking again next cycle")
             return False
+        trade["exit_order_id"] = None
         self.close_book(avg or self.ltp(symbol) or trade["entry_price"], reason)
         return True
 
     def close_book(self, exit_price, reason):
         trade = self.state["open"]
         sign = 1 if trade["side"] == "BUY" else -1
-        pnl = sign * (exit_price - trade["entry_price"]) * trade["qty"]
+        if trade.get("recovered"):
+            pnl = 0.0  # its entry price is not known
+        else:
+            pnl = sign * (exit_price - trade["entry_price"]) * trade["qty"]
         self.state["pnl"] += pnl
         self.state["open"] = None
         self._save_state()
         self.journal("exit", trade=trade, exit_price=exit_price, reason=reason, pnl=round(pnl, 2))
+        note = (
+            " (taken over after a lost state file; P&L not counted)"
+            if trade.get("recovered")
+            else ""
+        )
         self.notify(
             f"closed {trade['side']} {trade['qty']} {trade['symbol']} @ {exit_price:.2f} "
-            f"({reason}), P&L {pnl:.2f}, day {self.state['pnl']:.2f}"
+            f"({reason}), P&L {pnl:.2f}, day {self.state['pnl']:.2f}{note}"
         )
 
 
@@ -1194,8 +1577,8 @@ def main():
         raise SystemExit(1)
     strategy = SupertrendFvgStrategy(api(api_key=API_KEY, host=HOST, ws_url=WS_URL))
     strategy.setup()
-    if not strategy.symbols:
-        log("none of the configured symbols could be found; nothing to trade")
+    if not strategy.symbols and not strategy.unchecked:
+        log("none of the configured symbols exist on the exchange; nothing to trade")
         raise SystemExit(1)
     while True:
         try:

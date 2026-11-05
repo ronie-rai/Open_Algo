@@ -237,18 +237,28 @@ def test_unknown_fvg_mode_is_refused():
 def test_gaps_and_blocks_never_read_ahead(mode):
     o, h, lo, c = random_ohlc(400, 5, vol=0.006)
     atr = st.atr_rma(h, lo, c, 14)
-    full_gaps = st.detect_fvgs(h, lo, atr, mode=mode, min_atr=0.05)
-    assert len(full_gaps) > 5
-    for t in (60, 200, 350):
-        cut = st.detect_fvgs(h[: t + 1], lo[: t + 1], atr[: t + 1], mode=mode, min_atr=0.05)
-        at_t = st.detect_fvgs(h, lo, atr, mode=mode, min_atr=0.05, end=t)
+    min_atr = 0.05 if mode == "3candle" else 0.0  # two-candle gaps are rare on random bars
+    full_gaps = st.detect_fvgs(h, lo, atr, mode=mode, min_atr=min_atr)
+    assert len(full_gaps) >= 2
+    full_blocks = st.detect_order_blocks(o, h, lo, c, atr)
+    assert full_blocks
+    later_state_differs = False
+    for t in range(40, 400, 10):
+        cut = st.detect_fvgs(h[: t + 1], lo[: t + 1], atr[: t + 1], mode=mode, min_atr=min_atr)
+        at_t = st.detect_fvgs(h, lo, atr, mode=mode, min_atr=min_atr, end=t)
         assert [vars(g) for g in cut] == [vars(g) for g in at_t]
         assert all(g.created_idx <= t and g.filled_idx <= t and g.mid_hit_idx <= t for g in cut)
+        full_by_bar = {(g.kind, g.created_idx): g for g in full_gaps}
+        later_state_differs |= any(
+            vars(g) != vars(full_by_bar[(g.kind, g.created_idx)]) for g in cut
+        )
         b_cut = st.detect_order_blocks(
             o[: t + 1], h[: t + 1], lo[: t + 1], c[: t + 1], atr[: t + 1]
         )
         b_at = st.detect_order_blocks(o, h, lo, c, atr, end=t)
         assert [vars(b) for b in b_cut] == [vars(b) for b in b_at]
+    # the full series does fill gaps later, so equality above is not vacuous
+    assert later_state_differs
 
 
 def test_order_block_detection():
@@ -622,6 +632,471 @@ def test_unknown_symbols_are_skipped_at_setup(tmp_path):
     )
     strat.setup()
     assert strat.symbols == ["AAA"]
+
+
+def test_a_symbol_that_could_not_be_checked_is_retried_not_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "time", FakeTime())
+
+    class Flaky(FakeClient):
+        down = True
+
+        def symbol(self, symbol, **k):
+            if symbol == "BBB" and self.down:
+                raise ConnectionError("connection refused")
+            return super().symbol(symbol, **k)
+
+    now = datetime(2026, 11, 4, 10, 0, 6)
+    client = Flaky(["AAA", "BBB"], now)
+    strat = st.SupertrendFvgStrategy(
+        client, ["AAA", "BBB"], clock=lambda: now, data_dir=tmp_path, pause=0
+    )
+    strat.setup()
+    assert strat.symbols == ["AAA"] and strat.unchecked == ["BBB"]
+    client.down = False
+    strat.on_bar(now, BAR_3)
+    assert strat.symbols == ["AAA", "BBB"] and strat.unchecked == []
+
+
+def test_entry_window_is_judged_by_the_bar_close(harness):
+    strat, _client, _script, _now, _tmp = harness
+    day = datetime(2026, 11, 4)
+    last_bar_close = day.replace(hour=14, minute=45)
+    # the 14:40-14:45 bar, processed a few seconds after 14:45, may trade
+    assert strat.can_enter(day.replace(hour=14, minute=45, second=5), last_bar_close)[0]
+    assert strat.can_enter(day.replace(hour=14, minute=46, second=59), last_bar_close)[0]
+    # ...but never more than two minutes after the last entry time
+    assert not strat.can_enter(day.replace(hour=14, minute=47, second=1), last_bar_close)[0]
+    # the bar closing at 14:50 is outside the window
+    assert not strat.can_enter(
+        day.replace(hour=14, minute=50, second=5), day.replace(hour=14, minute=50)
+    )[0]
+    # the bar closing at 09:30 is the first one
+    assert strat.can_enter(
+        day.replace(hour=9, minute=30, second=5), day.replace(hour=9, minute=30)
+    )[0]
+    assert not strat.can_enter(
+        day.replace(hour=9, minute=25, second=5), day.replace(hour=9, minute=25)
+    )[0]
+
+
+def test_one_bad_history_frame_does_not_stop_the_other_symbols(harness, monkeypatch):
+    strat, client, _script, now, _tmp = harness
+    seen = []
+    monkeypatch.setattr(strat, "evaluate_symbol", lambda symbol, bars: seen.append(symbol))
+    good = client.bars
+
+    def history(symbol, **k):
+        if symbol == "AAA":
+            return pd.DataFrame({"price": [1.0]})  # no OHLC columns
+        return good
+
+    client.history = history
+    assert strat.on_bar(now, BAR_1)
+    assert seen == ["BBB", "CCC"]
+
+
+def test_load_bars_drops_the_forming_bar(tmp_path):
+    rng = np.random.default_rng(4)
+    n = 400
+    idx = pd.date_range("2026-11-02 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    c = 1000 * np.exp(np.cumsum(rng.normal(0, 0.004, n)))
+    o = np.r_[1000, c[:-1]]
+    df = pd.DataFrame(
+        {"open": o, "high": np.maximum(o, c) * 1.001, "low": np.minimum(o, c) * 0.999, "close": c},
+        index=idx,
+    )
+    forming = idx[-1].tz_localize(None)
+    now = (forming + pd.Timedelta(minutes=2, seconds=30)).to_pydatetime()
+
+    class History:
+        def __init__(self, frame):
+            self.frame = frame
+
+        def history(self, **k):
+            return self.frame
+
+    strat = st.SupertrendFvgStrategy(History(df), ["X"], clock=lambda: now, data_dir=tmp_path)
+    kept = strat.load_bars("X", now)
+    assert kept.index[-1] < forming and kept.index[-1] == idx[-2].tz_localize(None)
+    wild = df.copy()
+    wild.iloc[-1] = [1, 99999, 0.5, 99999]
+    strat.client = History(wild)
+    assert strat.load_bars("X", now).equals(kept)  # the forming bar never matters
+    # five seconds after it closes, the bar is kept
+    after = (forming + pd.Timedelta(minutes=5, seconds=5)).to_pydatetime()
+    assert strat.load_bars("X", after).index[-1] == forming
+
+
+# =============================================================================
+# ORDER SAFETY: a broker that fills orders and can lose answers
+# (the Auditor's scenarios, kept as regression tests)
+# =============================================================================
+class Broker:
+    """Positions change only when an order fills. MARKET orders fill at once
+    unless `hold_market` is set, then they stay open until release()."""
+
+    def __init__(self, symbols, now, books=True):
+        self.pos = dict.fromkeys(symbols, 0)
+        self.orders = {}
+        self.fills = []
+        self.n = 0
+        self.calls = []
+        self.hold_market = False
+        self.openpos_fail = 0  # fail the next N openposition calls
+        self.raise_after_accept = set()  # order types whose answer is lost after acceptance
+        self.smart_raise_after_accept = False
+        self.ltp_value = 100.0
+        self.books = books
+        idx = pd.date_range(
+            end=now.replace(second=0) - timedelta(minutes=5), periods=60, freq="5min"
+        )
+        self.bars = pd.DataFrame(
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0}, index=idx
+        )
+
+    def _fill(self, o):
+        q = o["qty"] if o["action"] == "BUY" else -o["qty"]
+        self.pos[o["symbol"]] += q
+        o["status"] = "complete"
+        self.fills.append(
+            {"symbol": o["symbol"], "action": o["action"], "average_price": o["fill"]}
+        )
+
+    def release(self):
+        for o in self.orders.values():
+            if o["status"] == "open":
+                self._fill(o)
+
+    def trigger_stops(self):
+        for o in self.orders.values():
+            if o["status"] == "trigger pending":
+                self._fill(o)
+
+    def live(self, symbol, kinds=("open", "trigger pending")):
+        return [k for k, o in self.orders.items() if o["symbol"] == symbol and o["status"] in kinds]
+
+    def symbol(self, symbol, **k):
+        return {"status": "success", "data": {"tick_size": 0.05, "lotsize": 1}}
+
+    def analyzerstatus(self):
+        return {"status": "success", "data": {"mode": "analyze"}}
+
+    def quotes(self, symbol, **k):
+        return {"status": "success", "data": {"ltp": self.ltp_value}}
+
+    def history(self, **k):
+        return self.bars
+
+    def openposition(self, symbol, **k):
+        if self.openpos_fail > 0:
+            self.openpos_fail -= 1
+            raise TimeoutError("read timed out")
+        return {"status": "success", "quantity": str(self.pos[symbol])}
+
+    def _new(self, symbol, action, qty, price_type, status, fill):
+        self.n += 1
+        oid = f"O{self.n}"
+        self.orders[oid] = {
+            "symbol": symbol,
+            "action": action,
+            "qty": qty,
+            "type": price_type,
+            "status": status,
+            "fill": fill,
+        }
+        return oid
+
+    def placeorder(self, symbol, action, quantity, price_type, trigger_price=0, **k):
+        self.calls.append(("place", symbol, action, quantity, price_type))
+        if price_type == "MARKET":
+            oid = self._new(symbol, action, quantity, price_type, "open", self.ltp_value)
+            if not self.hold_market:
+                self._fill(self.orders[oid])
+        else:
+            oid = self._new(symbol, action, quantity, price_type, "trigger pending", trigger_price)
+        if price_type in self.raise_after_accept:
+            raise TimeoutError("read timed out")
+        return {"status": "success", "orderid": oid}
+
+    def placesmartorder(self, symbol, action, quantity, position_size, **k):
+        delta = position_size - self.pos[symbol]
+        self.calls.append(("smart", symbol, delta))
+        if delta == 0:
+            return {"status": "success", "message": "No action needed"}
+        side = "BUY" if delta > 0 else "SELL"
+        oid = self._new(symbol, side, abs(delta), "MARKET", "open", self.ltp_value)
+        if not self.hold_market:
+            self._fill(self.orders[oid])
+        if self.smart_raise_after_accept:
+            raise TimeoutError("read timed out")
+        return {"status": "success", "orderid": oid}
+
+    def orderstatus(self, order_id, **k):
+        o = self.orders.get(order_id)
+        if o is None:
+            return {"status": "error", "message": "not found"}
+        avg = o["fill"] if o["status"] == "complete" else 0
+        return {
+            "status": "success",
+            "data": {"order_status": o["status"], "average_price": avg, "quantity": str(o["qty"])},
+        }
+
+    def cancelorder(self, order_id, **k):
+        o = self.orders[order_id]
+        self.calls.append(("cancel", order_id))
+        if o["status"] in ("open", "trigger pending"):
+            o["status"] = "cancelled"
+        return {"status": "success"}
+
+    def orderbook(self, **k):
+        if not self.books:
+            raise ConnectionError("order book unavailable")
+        rows = [
+            {
+                "orderid": oid,
+                "symbol": o["symbol"],
+                "exchange": "NSE",
+                "product": "MIS",
+                "action": o["action"],
+                "pricetype": o["type"],
+                "quantity": str(o["qty"]),
+                "order_status": o["status"],
+            }
+            for oid, o in self.orders.items()
+        ]
+        return {"status": "success", "data": {"orders": rows}}
+
+    def tradebook(self, **k):
+        if not self.books:
+            raise ConnectionError("trade book unavailable")
+        return {"status": "success", "data": list(self.fills)}
+
+
+@pytest.fixture
+def broker_factory(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "time", FakeTime())
+    monkeypatch.setattr(st, "plan_trade", fake_plan)
+    now = datetime(2026, 11, 4, 10, 0, 6)
+
+    def make(books=True, data_dir=None):
+        symbols = ["AAA", "BBB", "CCC"]
+        b = Broker(symbols, now, books=books)
+        s = st.SupertrendFvgStrategy(
+            b, symbols=symbols, clock=lambda: now, data_dir=data_dir or tmp_path, pause=0
+        )
+        s.setup()
+        script = {}
+        s.evaluate_symbol = lambda sym, bars: script.get(sym)
+        return s, b, script, now
+
+    return make
+
+
+SCENARIO_BARS = [datetime(2026, 11, 4, 9, m) for m in (35, 40, 45, 50)]
+
+
+def _bar(s, now, i):
+    s.bar_done.clear()
+    s.on_bar(now, SCENARIO_BARS[i])
+
+
+def _open_symbol(s):
+    return (s.state["open"] or {}).get("symbol")
+
+
+def test_s1_unreadable_position_after_the_entry_fill_still_manages_it(broker_factory):
+    s, b, script, now = broker_factory()
+    real = b.orderstatus
+
+    def status_then_fail(order_id, **k):
+        r = real(order_id, **k)
+        if order_id == "O1" and r["data"]["order_status"] == "complete":
+            b.openpos_fail = 1  # the position read right after the fill fails
+        return r
+
+    b.orderstatus = status_then_fail
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    b.orderstatus = real
+    assert _open_symbol(s) == "AAA" and s.state["open"]["qty"] == 10
+    assert len(b.live("AAA", ("trigger pending",))) == 1  # it has its stop
+    script.clear()
+    script["BBB"] = "SELL"
+    _bar(s, now, 1)
+    assert b.pos == {"AAA": 10, "BBB": 0, "CCC": 0}
+
+
+def test_unreadable_position_with_an_unfinished_entry_blocks_every_symbol(broker_factory):
+    s, b, script, now = broker_factory()
+    b.hold_market = True
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    assert s.state["pending"] and s.state["open"] is None
+    script.clear()
+    script["BBB"] = "BUY"
+    _bar(s, now, 1)
+    assert b.pos["BBB"] == 0 and not any(c[1] == "BBB" for c in b.calls if c[0] == "place")
+
+
+def test_s2_a_slow_exit_is_cancelled_before_it_is_retried(broker_factory):
+    s, b, script, now = broker_factory()
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    b.hold_market = True
+    b.ltp_value = 105.0  # target 104 reached
+    s.manage_open(now)
+    first_exit = s.state["open"]["exit_order_id"]
+    assert first_exit and b.pos["AAA"] == 10
+    s.manage_open(now)  # retry: the first exit is cancelled and confirmed first
+    assert b.orders[first_exit]["status"] == "cancelled"
+    assert len(b.live("AAA", ("open",))) == 1  # never two exit orders at once
+    b.release()
+    assert b.pos["AAA"] == 0
+    s.manage_open(now)
+    assert s.state["open"] is None
+
+
+def test_s3_unreadable_position_after_the_exit_order_is_not_booked_closed(broker_factory):
+    s, b, script, now = broker_factory()
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    b.hold_market = True
+    b.ltp_value = 105.0
+    real = b.placesmartorder
+
+    def smart_then_fail(**k):
+        r = real(**k)
+        b.openpos_fail = 1
+        return r
+
+    b.placesmartorder = smart_then_fail
+    s.manage_open(now)
+    assert _open_symbol(s) == "AAA"  # still managed
+    b.placesmartorder = real
+    b.hold_market = False
+    b.ltp_value = 100.0
+    script.clear()
+    script["BBB"] = "BUY"
+    _bar(s, now, 1)
+    assert b.pos["BBB"] == 0
+
+
+@pytest.mark.parametrize("books", [True, False])
+def test_s4_a_lost_stop_answer_never_leads_to_two_stops(broker_factory, books):
+    s, b, script, now = broker_factory(books=books)
+    b.raise_after_accept = {"SL-M"}
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    b.raise_after_accept = set()
+    assert len(b.live("AAA", ("trigger pending",))) == 1
+    if books:
+        assert s.state["open"]["stop_order_id"] == b.live("AAA", ("trigger pending",))[0]
+    else:
+        assert s.state["open"]["stop_check"]  # checked again; the script watches the stop
+    s.manage_open(now)
+    assert len(b.live("AAA", ("trigger pending",))) == 1
+    b.trigger_stops()
+    assert b.pos["AAA"] == 0
+
+
+def test_s5_a_lost_entry_answer_is_taken_over_with_its_stop(broker_factory):
+    s, b, script, now = broker_factory()
+    b.raise_after_accept = {"MARKET"}
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    b.raise_after_accept = set()
+    assert _open_symbol(s) == "AAA" and len(b.live("AAA", ("trigger pending",))) == 1
+    script.clear()
+    script["BBB"] = "BUY"
+    _bar(s, now, 1)
+    assert b.pos["BBB"] == 0
+
+
+def test_a_lost_entry_answer_still_working_is_cancelled_not_doubled(broker_factory):
+    s, b, script, now = broker_factory()
+    b.raise_after_accept = {"MARKET"}
+    b.hold_market = True
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    b.raise_after_accept = set()
+    b.hold_market = False
+    assert s.state["pending"] is not None  # the working order was cancelled; checked again
+    assert b.orders["O1"]["status"] == "cancelled"
+    script.clear()
+    s.step()
+    assert s.state["pending"] is None and s.state["open"] is None and b.pos["AAA"] == 0
+    assert [c for c in b.calls if c[0] == "place"] == [("place", "AAA", "BUY", 10, "MARKET")]
+
+
+def test_a_lost_exit_answer_is_resolved_from_the_books(broker_factory):
+    s, b, script, now = broker_factory()
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    b.smart_raise_after_accept = True
+    b.ltp_value = 106.0
+    s.manage_open(now)  # the exit filled at 106 but the answer was lost
+    b.smart_raise_after_accept = False
+    assert b.pos["AAA"] == 0 and _open_symbol(s) == "AAA"
+    b.ltp_value = 90.0
+    s.manage_open(now)
+    assert s.state["open"] is None
+    assert sum(1 for c in b.calls if c[0] == "smart") == 1  # no second exit was sent
+    assert s.state["pnl"] == pytest.approx(60.0)  # priced from the trade book, not the LTP
+
+
+def test_a_lost_exit_answer_while_still_working_is_cancelled_first(broker_factory):
+    s, b, script, now = broker_factory()
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    b.smart_raise_after_accept = True
+    b.hold_market = True
+    b.ltp_value = 105.0
+    s.manage_open(now)
+    b.smart_raise_after_accept = False
+    lost = b.live("AAA", ("open",))
+    assert len(lost) == 1
+    s.manage_open(now)  # cancels the lost exit, then sends a new one
+    assert b.orders[lost[0]]["status"] == "cancelled"
+    assert len(b.live("AAA", ("open",))) == 1
+    b.release()
+    assert b.pos["AAA"] == 0
+
+
+def test_s6_step_survives_missing_quotes_and_history(broker_factory):
+    s, b, _script, _now = broker_factory()
+    s.evaluate_symbol = st.SupertrendFvgStrategy.evaluate_symbol.__get__(s)
+    b.quotes = lambda **k: None
+    b.history = lambda **k: {"status": "error", "message": "boom"}
+    for _ in range(3):
+        s.step()
+
+
+def test_s7_an_unreadable_state_file_is_kept_aside_and_the_position_closed(
+    broker_factory, tmp_path
+):
+    s, b, script, now = broker_factory(data_dir=tmp_path / "state")
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    s.state_path.write_text(s.state_path.read_text()[:40])
+    s2 = st.SupertrendFvgStrategy(
+        b, symbols=["AAA", "BBB", "CCC"], clock=lambda: now, data_dir=tmp_path / "state", pause=0
+    )
+    s2.setup()
+    assert list((tmp_path / "state").glob("state.unreadable-*.json"))
+    assert s2.state["open"]["symbol"] == "AAA" and s2.state["open"]["recovered"]
+    s2.manage_open(now)
+    assert b.pos["AAA"] == 0
+    assert b.live("AAA") == []  # the old stop was cancelled before the close
+    assert s2.state["open"] is None and s2.state["pnl"] == 0.0
+
+
+def test_a_stop_filled_at_the_broker_is_booked_at_its_fill(broker_factory):
+    s, b, script, now = broker_factory()
+    script["AAA"] = "BUY"
+    _bar(s, now, 0)
+    b.trigger_stops()  # fills at the trigger, 98
+    s.manage_open(now)
+    assert s.state["open"] is None and s.state["pnl"] == pytest.approx(-20.0)
 
 
 # =============================================================================

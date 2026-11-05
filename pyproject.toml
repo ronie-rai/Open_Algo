@@ -196,6 +196,7 @@ exclude = [
     "db",
     "log",
     "strategies",
+    "test/fixtures/backtest",  # upstream example strategies, kept verbatim
 ]
 
 [tool.ruff.lint]
