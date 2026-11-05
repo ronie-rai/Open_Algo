@@ -196,7 +196,9 @@ exclude = [
     "db",
     "log",
     "strategies",
-    "test/fixtures/backtest",  # upstream example strategies, kept verbatim
+    # A verbatim upstream example strategy used as a test fixture; this only keeps a
+    # local `ruff check .` quiet about code that is not ours to restyle.
+    "test/fixtures/backtest",
 ]
 
 [tool.ruff.lint]
