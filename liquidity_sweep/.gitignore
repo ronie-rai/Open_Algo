@@ -1,0 +1,7 @@
+.venv/
+data/
+__pycache__/
+.pytest_cache/
+
+# The repo ignores *.csv; the regression fixture must stay tracked.
+!tests/fixtures/*.csv

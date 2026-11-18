@@ -1,0 +1,3 @@
+# Ruff settings for this folder: the repo rules, with the local modules as first party.
+extend = "../pyproject.toml"
+src = [".", "tests"]
