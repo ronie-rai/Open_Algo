@@ -56,7 +56,7 @@ dependencies = [
   "idna==3.19",
   "importlib-resources==6.5.2",
   "iniconfig==2.3.0",
-  "ipykernel==6.29.5",
+  "ipykernel==7.4.0",
   "ipython==9.16.1",
   "ipython-pygments-lexers==1.1.1",
   "itsdangerous==2.2.0",
