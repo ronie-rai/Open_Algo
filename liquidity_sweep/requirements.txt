@@ -1,8 +1,8 @@
 # Pinned for the liquidity sweep research backtester. Install with:
 #   uv pip install --python liquidity_sweep/.venv -r liquidity_sweep/requirements.txt
 pandas==2.3.3
-numpy==2.4.4
-matplotlib==3.11.1
+numpy==2.5.5
+matplotlib==3.11.2
 requests==2.34.2
 duckdb==1.5.5
-pytest==9.1.1
+pytest==9.2.0
